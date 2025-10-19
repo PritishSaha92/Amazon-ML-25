@@ -17,7 +17,7 @@ We develop a multimodal pricing system combining a feature‑engineered LightGBM
 Price depends on brand, quantity (mass/volume/pack), and category, with additional weak signals spread across noisy catalog text and product images. Images encode brand cues and quantities; text often contains units and variants. Our strategy extracts structured attributes and dense representations from both modalities, then learns price with models targeted directly at minimizing SMAPE in price space.
 
 **Key Observations:**
-- Catalog text is noisy but informative; character n‑grams and sentence embeddings help capture units/variants.
+- Catalog text is noisy but informative; char n‑grams help capture units and variants.
 - Image availability is high but not perfect; missing‑image handling is necessary.
 - Price relates monotonically to mass, volume, and pack_count.
 
