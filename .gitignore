@@ -60,12 +60,12 @@ Thumbs.db
 # Raw and processed data
 images/train/
 images/test/
+*.csv
+*.parquet
 
 # --- LGBM Model ---
-# Caches, inputs, and outputs for the LightGBM approach
+# Caches for the LightGBM approach
 Approach LGBM(with Feat Engg)/cache_new/**
-Approach LGBM(with Feat Engg)/input/*.parquet
-Approach LGBM(with Feat Engg)/output/*.csv
 
 # --- VLM Model ---
 # Datasets, checkpoints, logs, and outputs for the VLM approach
