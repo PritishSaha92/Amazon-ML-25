@@ -11,9 +11,13 @@ We develop a multimodal pricing system combining a feature‑engineered LightGBM
 
 ---
 
-## 2. Methodology Overview
+## 2. Implementation‑Level Engineering Diagram
 
-### 2.1 Problem Analysis
+![Implementation-Level Engineering Diagram](Implementation-Level%20Engineering%20Diagram.png)
+
+## 3. Methodology Overview
+
+### 3.1 Problem Analysis
 Price depends on brand, quantity (mass/volume/pack), and category, with additional weak signals spread across noisy catalog text and product images. Images encode brand cues and quantities; text often contains units and variants. Our strategy extracts structured attributes and dense representations from both modalities, then learns price with models targeted directly at minimizing SMAPE in price space.
 
 **Key Observations:**
@@ -21,7 +25,7 @@ Price depends on brand, quantity (mass/volume/pack), and category, with addition
 - Image availability is high but not perfect; missing‑image handling is necessary.
 - Price relates monotonically to mass, volume, and pack_count.
 
-### 2.2 Solution Strategy
+### 3.2 Solution Strategy
 **Approach Type:** Hybrid, two strong base models + stacking meta‑learner  
 **Core Innovation:**
 - High‑fidelity VLM data pipeline (offline preprocessing → WebDataset shards → DDP streaming) enabling stable, high‑throughput fine‑tuning of Qwen2.5‑VL for price extraction from image+text.
@@ -30,9 +34,9 @@ Price depends on brand, quantity (mass/volume/pack), and category, with addition
 
 ---
 
-## 3. Model Architecture
+## 4. Model Architecture
 
-### 3.1 Architecture Overview
+### 4.1 Architecture Overview
 
 For a deeper, step‑by‑step theoretical explanation of every component and training phase, see [Detailed Explanation (PDF)](Detailed%20Explanation.pdf).
 
@@ -41,7 +45,7 @@ For a deeper, step‑by‑step theoretical explanation of every component and tr
 - Model B (VLM DDP): Qwen2.5‑VL‑3B fine‑tuned via Unsloth LoRA using DDP and WebDataset streaming of preprocessed tensors.
 - Meta‑learner: trained on OOF predictions from Models A and B + global features; blends fold‑wise test predictions to produce final `test_out.csv`.
 
-### 3.2 Model Components
+### 4.2 Model Components
 
 **Text Processing Pipeline:**
 - Preprocessing: TF‑IDF (word 1–2, char 3–5, sublinear TF), TruncatedSVD→4096 dims, StandardScaler + L2 normalization.
@@ -64,11 +68,11 @@ For a deeper, step‑by‑step theoretical explanation of every component and tr
 - Model B: Qwen2.5‑VL‑3B with Unsloth LoRA (4‑bit base, bf16); DDP/WebDataset streaming; periodic checkpointing; SMAPE monitoring utility.
 - Meta‑learner: regression model trained on OOF predictions [A,B] + global features (e.g., unit totals), validated fold‑wise; test predictions are blended per fold.
 
-### 3.3 Implementation‑Level Engineering Diagram
+### 4.3 Implementation‑Level Engineering Diagram
 
 ![Implementation-Level Engineering Diagram](Implementation-Level%20Engineering%20Diagram.png)
 
-## 4. Conclusion
+## 5. Conclusion
 A hybrid, production‑minded pipeline combines a feature‑engineered LightGBM with a high‑throughput VLM fine‑tune and a stacking meta‑learner. Offline preprocessing and WebDataset streaming remove I/O bottlenecks; monotonic constraints and careful validation stabilize generalization; stacking integrates complementary signals to achieve low SMAPE.
 
 ---
