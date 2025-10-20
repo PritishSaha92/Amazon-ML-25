@@ -68,10 +68,6 @@ For a deeper, step‑by‑step theoretical explanation of every component and tr
 - Model B: Qwen2.5‑VL‑3B with Unsloth LoRA (4‑bit base, bf16); DDP/WebDataset streaming; periodic checkpointing; SMAPE monitoring utility.
 - Meta‑learner: regression model trained on OOF predictions [A,B] + global features (e.g., unit totals), validated fold‑wise; test predictions are blended per fold.
 
-### 4.3 Implementation‑Level Engineering Diagram
-
-![Implementation-Level Engineering Diagram](Implementation-Level%20Engineering%20Diagram.png)
-
 ## 5. Conclusion
 A hybrid, production‑minded pipeline combines a feature‑engineered LightGBM with a high‑throughput VLM fine‑tune and a stacking meta‑learner. Offline preprocessing and WebDataset streaming remove I/O bottlenecks; monotonic constraints and careful validation stabilize generalization; stacking integrates complementary signals to achieve low SMAPE.
 
