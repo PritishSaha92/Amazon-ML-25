@@ -53,7 +53,7 @@ For a deeper, step‑by‑step theoretical explanation of every component and tr
 - Clustering: MiniBatchKMeans on train‑only embeddings to produce `text_kmeans_cluster_id` (no leakage).
 
 **Image Processing Pipeline:**
-- VLM extraction: Qwen2.5‑VL (3B Instruct) parses image+text into structured fields (brand, pack_count, mass_g, volume_ml, category, keywords) with strict validation and catalog fallbacks.
+- VLM extraction (primary): Qwen2.5‑VL (3B Instruct) takes image + catalog text via a chat prompt and returns structured fields (brand, pack_count, mass_g, volume_ml, category, keywords). Outputs are validated and normalized (units/ranges); no OCR or heavy rule‑based parsing is used.
 - CLIP: ViT‑L/14 embeddings (L2‑normalized) for images; missing‑image mask preserved.
 - Offline VLM tensorization (for Model B): `AutoProcessor` converts chat examples into `input_ids`, `attention_mask`, and patch embeddings `pixel_values` saved as `.npy`; metadata `image_grid_thw` saved alongside.
 
