@@ -33,6 +33,9 @@ Price depends on brand, quantity (mass/volume/pack), and category, with addition
 ## 3. Model Architecture
 
 ### 3.1 Architecture Overview
+
+For a deeper, step‑by‑step theoretical explanation of every component and training phase, see [Detailed Explanation (PDF)](Detailed%20Explanation.pdf).
+
 - Data sources: `dataset/train.csv`, `dataset/test.csv`, `images/train|test` from `image_link`.
 - Model A (LGBM): feature‑engineered multimodal tabular model trained on log(price+1).
 - Model B (VLM DDP): Qwen2.5‑VL‑3B fine‑tuned via Unsloth LoRA using DDP and WebDataset streaming of preprocessed tensors.
@@ -61,7 +64,9 @@ Price depends on brand, quantity (mass/volume/pack), and category, with addition
 - Model B: Qwen2.5‑VL‑3B with Unsloth LoRA (4‑bit base, bf16); DDP/WebDataset streaming; periodic checkpointing; SMAPE monitoring utility.
 - Meta‑learner: regression model trained on OOF predictions [A,B] + global features (e.g., unit totals), validated fold‑wise; test predictions are blended per fold.
 
----
+### 3.3 Implementation‑Level Engineering Diagram
+
+![Implementation-Level Engineering Diagram](Implementation-Level%20Engineering%20Diagram.png)
 
 ## 4. Conclusion
 A hybrid, production‑minded pipeline combines a feature‑engineered LightGBM with a high‑throughput VLM fine‑tune and a stacking meta‑learner. Offline preprocessing and WebDataset streaming remove I/O bottlenecks; monotonic constraints and careful validation stabilize generalization; stacking integrates complementary signals to achieve low SMAPE.
