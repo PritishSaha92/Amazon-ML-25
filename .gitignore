@@ -64,8 +64,9 @@ images/test/
 *.parquet
 
 # --- LGBM Model ---
-# Caches for the LightGBM approach
+# Caches and datasets for the LightGBM approach
 Approach LGBM(with Feat Engg)/cache_new/**
+Approach LGBM(with Feat Engg)/dataset/
 
 # --- VLM Model ---
 # Datasets, checkpoints, logs, and outputs for the VLM approach
@@ -79,3 +80,6 @@ Approach VLM(with SFT)/**/wandb/**
 # Generated JSONL data splits
 Approach VLM(with SFT)/**/train_split.jsonl
 Approach VLM(with SFT)/**/validation_split.jsonl
+
+# Specific file ignores
+Approach VLM(with SFT)/Engg Optimization Approach/Optimizing VLM Training on Limited Notebook.pdf
