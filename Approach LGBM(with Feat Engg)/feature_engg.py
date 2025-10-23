@@ -170,13 +170,21 @@ def feature_engineer_train_data(
         with np.load(embeddings_path) as data:
             embedding_ids = data['sample_id']
             embeddings = data['embedding']
-        df_embeddings = pd.DataFrame({'sample_id': embedding_ids, 'image_embedding': list(embeddings)})
+        # Ensure consistent dtypes and convert embedding rows to Python lists
+        emb_dim = int(embeddings.shape[1]) if embeddings.ndim == 2 else 768
+        df_embeddings = pd.DataFrame({
+            'sample_id': embedding_ids.astype('int64'),
+            'image_embedding': [row.astype(np.float32).tolist() for row in embeddings]
+        })
     except FileNotFoundError as e:
         print(f"❌ ERROR: A file was not found. Details: {e}")
         return
     
     # --- 2. Merge External Data Sources ---
     print("Step 2: Merging K-Means clusters and image embeddings...")
+    # Harmonize key dtype prior to merge to avoid join misses
+    df_train['sample_id'] = df_train['sample_id'].astype('int64')
+    df_kmeans['sample_id'] = df_kmeans['sample_id'].astype('int64')
     df_train = pd.merge(df_train, df_kmeans[['sample_id', 'text_kmeans_cluster_id']], on='sample_id', how='left')
     df_train = pd.merge(df_train, df_embeddings, on='sample_id', how='left')
     
@@ -204,9 +212,14 @@ def feature_engineer_train_data(
 
     # --- 5. Expand Image Embeddings ---
     print("Step 5: Expanding image embedding vectors into columns...")
-    df_train['image_embedding'] = df_train['image_embedding'].apply(
-        lambda x: [0.0] * 768 if not isinstance(x, list) else x
-    )
+    # Convert any numpy arrays to lists; fill missing with zeros of correct dim
+    def _to_list_or_zeros(v):
+        if isinstance(v, list):
+            return v
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        return [0.0] * emb_dim
+    df_train['image_embedding'] = df_train['image_embedding'].apply(_to_list_or_zeros)
     embedding_df_img = pd.DataFrame(df_train['image_embedding'].tolist(), index=df_train.index)
     embedding_df_img.columns = [f'img_embedding_{i}' for i in range(768)]
     df_train = pd.concat([df_train, embedding_df_img], axis=1)

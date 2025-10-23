@@ -7,7 +7,7 @@
 ---
 
 ## 1. Executive Summary
-We develop a multimodal pricing system combining a feature‑engineered LightGBM model (Model A) with a vision‑language model fine‑tuned under a high‑throughput DDP/WebDataset pipeline (Model B). Final predictions are produced by a stacking meta‑learner trained on OOF predictions plus global features, yielding robust generalization and competitive SMAPE.
+We develop a multimodal pricing system combining a feature‑engineered LightGBM model (Model A) with a vision‑language model fine‑tuned under a high‑throughput DDP/WebDataset pipeline (Model B). Model A trains in original price space using a custom Pseudo‑Huber objective (delta from price IQR) with SMAPE validation and monotonic constraints. Final predictions are produced by a stacking meta‑learner trained on OOF predictions plus global features, yielding robust generalization and competitive SMAPE.
 
 ---
 
@@ -41,7 +41,8 @@ Price depends on brand, quantity (mass/volume/pack), and category, with addition
 For a deeper, step‑by‑step theoretical explanation of every component and training phase, see [Detailed Explanation (PDF)](Detailed%20Explanation.pdf).
 
 - Data sources: `dataset/train.csv`, `dataset/test.csv`, `images/train|test` from `image_link`.
-- Model A (LGBM): feature‑engineered multimodal tabular model trained on log(price+1).
+- Model A (LGBM): feature‑engineered multimodal tabular model trained in original price space with a custom Pseudo‑Huber objective (delta from price IQR), SMAPE validation, and monotonic constraints.
+ - Model A (LGBM): feature‑engineered multimodal tabular model trained in original price space with a custom Pseudo‑Huber objective (delta from price IQR), validated by SMAPE, and constrained monotonically on quantity features.
 - Model B (VLM DDP): Qwen2.5‑VL‑3B fine‑tuned via Unsloth LoRA using DDP and WebDataset streaming of preprocessed tensors.
 - Meta‑learner: trained on OOF predictions from Models A and B + global features; blends fold‑wise test predictions to produce final `test_out.csv`.
 
@@ -64,9 +65,9 @@ For a deeper, step‑by‑step theoretical explanation of every component and tr
 - total_flags = sum(keyword flags)
 
 **Learning:**
-- Model A: LightGBM regressor on log(price+1), Huber loss, SMAPE validation, monotonic constraints on mass/volume/pack_count, Optuna HPO.
+- Model A: LightGBM regressor in original price space with a custom Pseudo‑Huber objective (delta from price IQR), SMAPE validation, monotonic constraints on mass/volume/pack_count, Optuna HPO; end‑to‑end training and inference remain in price space (no log/expm1 conversions).
 - Model B: Qwen2.5‑VL‑3B with Unsloth LoRA (4‑bit base, bf16); DDP/WebDataset streaming; periodic checkpointing; SMAPE monitoring utility.
-- Meta‑learner: regression model trained on OOF predictions [A,B] + global features (e.g., unit totals), validated fold‑wise; test predictions are blended per fold.
+- Meta‑learner: regression model trained on OOF predictions [A,B] + global features (e.g., unit totals), validated fold‑wise; test predictions are blended per fold. The `ensemble.py` script has been updated to operate fully in price space and read Model A OOF from `Approach LGBM(with Feat Engg)/output/oof_predictions.csv`.
 
 ## 5. Conclusion
 A hybrid, production‑minded pipeline combines a feature‑engineered LightGBM with a high‑throughput VLM fine‑tune and a stacking meta‑learner. Offline preprocessing and WebDataset streaming remove I/O bottlenecks; monotonic constraints and careful validation stabilize generalization; stacking integrates complementary signals to achieve low SMAPE.
@@ -96,7 +97,7 @@ A hybrid, production‑minded pipeline combines a feature‑engineered LightGBM 
 ### B. Reproducibility (High‑level)
 1) Prepare LGBM masters and train Model A  
    - Build structured CSVs and TF‑IDF+SVD → `input/master_train.parquet`/`input/master_test.parquet`  
-   - Train `train_model_a.py` → save model + metadata; infer `predict_model_a.py` → OOF + test predictions
+   - Train `train_model_a.py` (Pseudo‑Huber in price space) → saves booster + metadata; infer `predict_model_a.py` (price space) → OOF + test predictions
 2) Prepare VLM DDP and train Model B  
    - Download/resize images; create JSONL  
    - Offline preprocess and shard (or use existing shards)  
@@ -107,6 +108,8 @@ A hybrid, production‑minded pipeline combines a feature‑engineered LightGBM 
    - Write final `dataset/sample_test_out.csv` (or `test_out.csv`)
 
 ### C. Implementation Notes
+- Price space throughout: Model A, inference, and ensemble operate entirely in price space (no log/expm1), eliminating objective–metric mismatch and instability near zero.
+- Ensemble input expectations: Model A OOF at `Approach LGBM(with Feat Engg)/output/oof_predictions.csv` (column `oof_price`), Model A test at `Approach LGBM(with Feat Engg)/dataset/sample_test_out.csv` (column `price`).
 - VLM tokens: collator masks all special tokens `>= vocab_size` to `-100` to prevent OOB labels during loss.
 - Throughput: prefer WebDataset streaming (sequential TAR I/O) with tuned dataloader workers; disable gradient checkpointing when VRAM headroom exists; raise batch size to ~90–95% VRAM.
 - Monotonic constraints: enforce positive monotonicity on quantity features in LGBM to reflect real‑world trends.

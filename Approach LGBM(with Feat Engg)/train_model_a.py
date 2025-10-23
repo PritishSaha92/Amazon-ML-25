@@ -48,15 +48,47 @@ def smape(y_true, y_pred):
     denominator = (np.abs(y_true) + np.abs(y_pred)) / 2 + 1e-8
     return np.mean(numerator / denominator) * 100
 
-def lgbm_smape_on_log_metric(y_true, y_pred):
+def smape_feval(preds, dataset):
     """
-    Custom SMAPE on price-space while training on log(price+1).
-    LightGBM passes y_true and y_pred as the training target space (log).
+    LightGBM custom evaluation metric for SMAPE in original price space.
+    Returns (name, value, is_higher_better=False).
     """
-    y_true_price = np.expm1(y_true)
-    y_pred_price = np.expm1(y_pred)
-    score = smape(y_true_price, y_pred_price)
-    return 'smape', score, False  # lower is better
+    y_true = dataset.get_label()
+    preds_clipped = np.clip(preds, 0.0, None)
+    score = smape(y_true, preds_clipped)
+    return 'smape', score, False
+
+
+def compute_delta_from_iqr(y: np.ndarray) -> float:
+    """
+    Compute Pseudo-Huber delta from the IQR of prices.
+    Uses a robust scale; optionally scaled via env PH_DELTA_MULT (default 1.0).
+    """
+    y = np.asarray(y, dtype=float)
+    q25, q75 = np.percentile(y, [25.0, 75.0])
+    iqr = max(1e-6, float(q75 - q25))
+    # Robust scale; dividing by 1.349 approximates std if Gaussian
+    base_delta = iqr / 1.349
+    mult = float(os.environ.get('PH_DELTA_MULT', '1.0'))
+    min_delta = float(os.environ.get('PH_MIN_DELTA', '1e-3'))
+    return max(min_delta, base_delta * mult)
+
+
+def make_pseudo_huber_fobj(delta: float):
+    """
+    Create a custom objective for Pseudo-Huber loss with the given delta.
+    Loss: L = delta^2 * (sqrt(1 + (r/delta)^2) - 1)
+    grad = r / sqrt(1 + (r/delta)^2)
+    hess = 1 / (1 + (r/delta)^2)^(3/2)
+    """
+    def fobj(preds: np.ndarray, dataset: lgb.Dataset):
+        y_true = dataset.get_label()
+        residual = preds - y_true
+        scale = np.sqrt(1.0 + (residual / delta) ** 2)
+        grad = residual / scale
+        hess = 1.0 / (scale ** 3)
+        return grad, hess
+    return fobj
 
 
 # =============================================================================
@@ -246,51 +278,85 @@ def run_kfold_oof(
     base_params: dict,
     n_splits: int = 5,
     random_state: int = 42,
+    categorical_cols: List[str] | None = None,
 ) -> tuple:
     """
-    Perform KFold OOF training with early stopping and SMAPE monitoring on price-space.
-    Returns (oof_df, cv_report_dict).
+    Perform KFold OOF training with custom Pseudo-Huber objective and SMAPE feval.
+    Returns (oof_df, cv_report_dict). Trains and evaluates in original price space.
     """
     print(f"--- OOF CV: {n_splits}-fold ---")
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    sample_ids = X.index.to_series().copy()  # will map back to df via index
 
-    oof_pred_log = np.full(shape=(len(X),), fill_value=np.nan, dtype=float)
+    oof_pred_price = np.full(shape=(len(X),), fill_value=np.nan, dtype=float)
     fold_scores = []
 
     for fold, (tr_idx, va_idx) in enumerate(kf.split(X), start=1):
         X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
         y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
 
-        params = base_params.copy()
-        model = lgb.LGBMRegressor(**params)
-        model.fit(
-            X_tr, y_tr,
-            eval_set=[(X_va, y_va)],
-            eval_metric=lgbm_smape_on_log_metric,
-            callbacks=[lgb.early_stopping(300, verbose=False)]
+        # Build datasets
+        dtrain = lgb.Dataset(
+            X_tr,
+            label=y_tr.values,
+            feature_name=feature_cols,
+            categorical_feature=categorical_cols or []
+        )
+        dvalid = lgb.Dataset(
+            X_va,
+            label=y_va.values,
+            feature_name=feature_cols,
+            categorical_feature=categorical_cols or [],
+            reference=dtrain
         )
 
-        pred_va_log = model.predict(X_va)
-        pred_va_price = np.expm1(pred_va_log)
-        y_va_price = np.expm1(y_va)
-        fold_smape = smape(y_va_price.values, pred_va_price)
+        # Delta from training fold
+        delta = compute_delta_from_iqr(y_tr.values)
+        fobj = make_pseudo_huber_fobj(delta)
+
+        # Train
+        params = base_params.copy()
+        num_boost_round = int(params.pop('num_boost_round', params.pop('n_estimators', 2000)))
+        try:
+            booster = lgb.train(
+                params,
+                dtrain,
+                num_boost_round=num_boost_round,
+                valid_sets=[dvalid],
+                feval=smape_feval,
+                fobj=fobj,
+                callbacks=[lgb.early_stopping(300, verbose=False)]
+            )
+        except Exception as gpu_err:
+            if params.get('device_type', 'cpu') == 'gpu':
+                params['device_type'] = 'cpu'
+                booster = lgb.train(
+                    params,
+                    dtrain,
+                    num_boost_round=num_boost_round,
+                    valid_sets=[dvalid],
+                    feval=smape_feval,
+                    fobj=fobj,
+                    callbacks=[lgb.early_stopping(300, verbose=False)]
+                )
+            else:
+                raise gpu_err
+
+        pred_va_price = booster.predict(X_va, num_iteration=booster.best_iteration)
+        pred_va_price = np.clip(pred_va_price, 0.0, None)
+        fold_smape = smape(y_va.values, pred_va_price)
         fold_scores.append(float(fold_smape))
-        oof_pred_log[va_idx] = pred_va_log
+        oof_pred_price[va_idx] = pred_va_price
         print(f"   -> Fold {fold}/{n_splits} SMAPE: {fold_smape:.4f}%")
 
-    # Overall OOF score on price-space
-    oof_price = np.expm1(oof_pred_log)
-    y_price = np.expm1(y)
-    overall_smape = smape(y_price.values, oof_price)
+    # Overall OOF score
+    overall_smape = smape(y.values, oof_pred_price)
     print(f"--- OOF SMAPE: {overall_smape:.4f}% | Folds mean {np.mean(fold_scores):.4f}% ± {np.std(fold_scores):.4f}% ---")
 
     # Build OOF dataframe aligned to original df rows via index
     oof_df = pd.DataFrame({
         'row_index': X.index,
-        'sample_id': X.index,  # index is set to df.index (we'll replace later if needed)
-        'oof_price': oof_price,
-        'oof_log_price': oof_pred_log,
+        'sample_id': X.index,
+        'oof_price': oof_pred_price,
     })
 
     cv_report = {
@@ -307,10 +373,9 @@ def run_kfold_oof(
 # =============================================================================
 # 5. HYPERPARAMETER TUNING WITH OPTUNA
 # =============================================================================
-def run_hyperparameter_tuning(X_train, y_train, X_val, y_val, feature_names: List[str]):
+def run_hyperparameter_tuning(X_train, y_train, X_val, y_val, feature_names: List[str], categorical_cols: List[str]):
     """
-    Uses Optuna to find the best hyperparameters for the LGBM Regressor, optimizing for SMAPE (price-space).
-    Trains on log(price+1) with Huber objective (compatible with monotone constraints).
+    Optuna HPO minimizing SMAPE in original price space using Pseudo-Huber objective.
     """
     print("--- Stage 3: Hyperparameter Tuning (Optuna, minimize SMAPE on price) ---")
 
@@ -319,7 +384,6 @@ def run_hyperparameter_tuning(X_train, y_train, X_val, y_val, feature_names: Lis
 
     # Subsample for HPO if enabled
     if HPO_SAMPLE_FRAC < 1.0:
-        # Build a temporary training/val subset for faster HPO
         n_rows = len(X_train)
         take = max(HPO_MIN_ROWS, int(n_rows * HPO_SAMPLE_FRAC))
         X_train_hpo = X_train.iloc[:take]
@@ -330,11 +394,17 @@ def run_hyperparameter_tuning(X_train, y_train, X_val, y_val, feature_names: Lis
         X_train_hpo, y_train_hpo = X_train, y_train
         X_val_hpo, y_val_hpo = X_val, y_val
 
+    dvalid_template = lgb.Dataset(
+        X_val_hpo,
+        label=y_val_hpo.values,
+        feature_name=feature_names,
+        categorical_feature=categorical_cols,
+    )
+
     def objective(trial):
         params = {
-            'objective': 'huber',
+            'objective': 'None',
             'metric': 'None',
-            'n_estimators': HPO_N_EST,
             'learning_rate': trial.suggest_float('learning_rate', 0.02, 0.06),
             'num_leaves': trial.suggest_int('num_leaves', 512, HPO_NUM_LEAVES_MAX),
             'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 0.9),
@@ -344,9 +414,9 @@ def run_hyperparameter_tuning(X_train, y_train, X_val, y_val, feature_names: Lis
             'max_depth': -1,
             'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
             'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
-            'random_state': 42,
-            'n_jobs': NUM_THREADS,
-            'verbose': -1,
+            'seed': 42,
+            'num_threads': NUM_THREADS,
+            'verbosity': -1,
             # GPU settings
             'device': 'gpu' if prefer_gpu else 'cpu',
             'device_type': 'gpu' if prefer_gpu else 'cpu',
@@ -358,32 +428,46 @@ def run_hyperparameter_tuning(X_train, y_train, X_val, y_val, feature_names: Lis
             'monotone_constraints': monotone_vec,
         }
 
-        model = lgb.LGBMRegressor(**params)
+        dtrain = lgb.Dataset(
+            X_train_hpo,
+            label=y_train_hpo.values,
+            feature_name=feature_names,
+            categorical_feature=categorical_cols,
+        )
+        dvalid = dvalid_template
+
+        # Data-driven delta
+        delta = compute_delta_from_iqr(y_train_hpo.values)
+        fobj = make_pseudo_huber_fobj(delta)
+
         try:
-            model.fit(
-                X_train_hpo, y_train_hpo,
-                eval_set=[(X_val_hpo, y_val_hpo)],
-                eval_metric=lgbm_smape_on_log_metric,
+            booster = lgb.train(
+                params,
+                dtrain,
+                num_boost_round=HPO_N_EST,
+                valid_sets=[dvalid],
+                feval=smape_feval,
+                fobj=fobj,
                 callbacks=[lgb.early_stopping(EARLY_STOP_HPO, verbose=False)]
             )
         except Exception as gpu_err:
             if params['device_type'] == 'gpu':
-                # Fallback to CPU seamlessly
                 params['device_type'] = 'cpu'
-                model = lgb.LGBMRegressor(**params)
-                model.fit(
-                    X_train, y_train,
-                    eval_set=[(X_val, y_val)],
-                    eval_metric=lgbm_smape_on_log_metric,
-                    callbacks=[lgb.early_stopping(200, verbose=False)]
+                booster = lgb.train(
+                    params,
+                    dtrain,
+                    num_boost_round=HPO_N_EST,
+                    valid_sets=[dvalid],
+                    feval=smape_feval,
+                    fobj=fobj,
+                    callbacks=[lgb.early_stopping(EARLY_STOP_HPO, verbose=False)]
                 )
             else:
                 raise gpu_err
 
-        preds_log = model.predict(X_val_hpo)
-        preds_price = np.expm1(preds_log)
-        y_val_price = np.expm1(y_val_hpo)
-        return smape(y_val_price, preds_price)
+        preds_price = booster.predict(X_val_hpo, num_iteration=booster.best_iteration)
+        preds_price = np.clip(preds_price, 0.0, None)
+        return smape(y_val_hpo.values, preds_price)
 
     study = optuna.create_study(direction='minimize')
     if HPO_TIMEOUT > 0:
@@ -413,13 +497,12 @@ if __name__ == "__main__":
     # Optional feature engineering
     df = engineer_features(df)
 
-    # Define features and target (log price)
+    # Define features and target in original price space (no log)
     TARGET = 'price'
-    df['log_price'] = np.log1p(df[TARGET].astype(float))
-    feature_cols = [c for c in df.columns if c not in ['sample_id', TARGET, 'log_price']]
+    feature_cols = [c for c in df.columns if c not in ['sample_id', TARGET]]
 
     X = df[feature_cols]
-    y = df['log_price']
+    y = df[TARGET].astype(float)
 
     # Split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
@@ -447,20 +530,19 @@ if __name__ == "__main__":
     print("   -> Saved feature metadata to output/model_a_metadata.json")
 
     # HPO
-    best_params = run_hyperparameter_tuning(X_train, y_train, X_val, y_val, feature_cols)
+    best_params = run_hyperparameter_tuning(X_train, y_train, X_val, y_val, feature_cols, categorical_cols)
 
     # Final training
-    print("\n--- Stage 4: Training final model with best parameters... ---")
+    print("\n--- Stage 4: Training final model with best parameters (Pseudo-Huber) ---")
     monotone_vec = build_monotone_constraints(feature_cols)
     prefer_gpu = os.environ.get('LGBM_FORCE_CPU', '0') != '1'
 
     final_params = best_params.copy()
     final_params.update({
-        'objective': 'huber',
+        'objective': 'None',
         'metric': 'None',
-        'n_estimators': max(8000, int(best_params.get('n_estimators', 6000))),
-        'random_state': 42,
-        'n_jobs': NUM_THREADS,
+        'seed': 42,
+        'num_threads': NUM_THREADS,
         'device': 'gpu' if prefer_gpu else 'cpu',
         'device_type': 'gpu' if prefer_gpu else 'cpu',
         'gpu_device_id': 0,
@@ -469,26 +551,49 @@ if __name__ == "__main__":
         'bin_construct_sample_cnt': BIN_CONSTRUCT,
         'feature_pre_filter': False,
         'monotone_constraints': monotone_vec,
-        'verbose': -1,
+        'verbosity': -1,
     })
+    final_num_boost_round = max(8000, int(best_params.get('n_estimators', best_params.get('num_boost_round', 6000))))
 
-    final_model = lgb.LGBMRegressor(**final_params)
+    dtrain_full = lgb.Dataset(
+        X_train,
+        label=y_train.values,
+        feature_name=feature_cols,
+        categorical_feature=categorical_cols,
+    )
+    dvalid_full = lgb.Dataset(
+        X_val,
+        label=y_val.values,
+        feature_name=feature_cols,
+        categorical_feature=categorical_cols,
+        reference=dtrain_full,
+    )
+
+    # Data-driven delta from training labels
+    final_delta = compute_delta_from_iqr(y_train.values)
+    final_fobj = make_pseudo_huber_fobj(final_delta)
+
     try:
-        final_model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            eval_metric=lgbm_smape_on_log_metric,
+        booster = lgb.train(
+            final_params,
+            dtrain_full,
+            num_boost_round=final_num_boost_round,
+            valid_sets=[dvalid_full],
+            feval=smape_feval,
+            fobj=final_fobj,
             callbacks=[lgb.early_stopping(EARLY_STOP_FINAL, verbose=True)]
         )
     except Exception as gpu_err:
         if final_params['device_type'] == 'gpu':
             print(f"⚠️ GPU unavailable ({gpu_err}); falling back to CPU.")
             final_params['device_type'] = 'cpu'
-            final_model = lgb.LGBMRegressor(**final_params)
-            final_model.fit(
-                X_train, y_train,
-                eval_set=[(X_val, y_val)],
-                eval_metric=lgbm_smape_on_log_metric,
+            booster = lgb.train(
+                final_params,
+                dtrain_full,
+                num_boost_round=final_num_boost_round,
+                valid_sets=[dvalid_full],
+                feval=smape_feval,
+                fobj=final_fobj,
                 callbacks=[lgb.early_stopping(EARLY_STOP_FINAL, verbose=True)]
             )
         else:
@@ -496,10 +601,9 @@ if __name__ == "__main__":
 
     # Evaluate on test (price-space SMAPE)
     print("\n--- Stage 5: Final Evaluation ---")
-    test_preds_log = final_model.predict(X_test)
-    test_preds_price = np.expm1(test_preds_log)
-    y_test_price = np.expm1(y_test)
-    final_smape = smape(y_test_price.values, test_preds_price)
+    test_preds_price = booster.predict(X_test, num_iteration=booster.best_iteration)
+    test_preds_price = np.clip(test_preds_price, 0.0, None)
+    final_smape = smape(y_test.values, test_preds_price)
     print(f"\n   -> Final SMAPE on Test Set: {final_smape:.4f}%\n")
 
     # OOF CV (using the full available labeled data)
@@ -513,11 +617,12 @@ if __name__ == "__main__":
         y_all = pd.concat([y_train, y_val, y_test], axis=0)
         # Ensure alignment and consistent order
         X_all = X_all.reindex(columns=feature_cols)
-        X_all.index = df.loc[X_all.index, 'sample_id'] if 'sample_id' in df.columns else X_all.index
         base_params_for_oof = final_params.copy()
         # Slightly fewer estimators for faster OOF
-        base_params_for_oof['n_estimators'] = max(2000 if FAST_MODE else 4000, int(final_params.get('n_estimators', 6000)))
-        oof_df, cv_report = run_kfold_oof(X_all, y_all, feature_cols, base_params_for_oof, n_splits=OOF_SPLITS, random_state=42)
+        base_params_for_oof['num_boost_round'] = max(2000 if FAST_MODE else 4000, int(best_params.get('n_estimators', best_params.get('num_boost_round', 6000))))
+        oof_df, cv_report = run_kfold_oof(
+            X_all, y_all, feature_cols, base_params_for_oof, n_splits=OOF_SPLITS, random_state=42, categorical_cols=categorical_cols
+        )
         # Map correct sample_id if present
         if 'sample_id' in df.columns:
             oof_df['sample_id'] = oof_df['row_index'].map(lambda idx: df.iloc[idx]['sample_id'] if isinstance(idx, (int, np.integer)) and idx < len(df) else idx)
@@ -525,7 +630,7 @@ if __name__ == "__main__":
         try:
             os.makedirs('output', exist_ok=True)
             oof_path = os.path.join('output', 'oof_predictions.csv')
-            oof_df[['sample_id', 'oof_price', 'oof_log_price']].to_csv(oof_path, index=False)
+            oof_df[['sample_id', 'oof_price']].to_csv(oof_path, index=False)
             with open(os.path.join('output', 'cv_report.json'), 'w', encoding='utf-8') as f:
                 json.dump(cv_report, f, indent=2)
             print(f"   -> Saved OOF predictions to {oof_path}")
@@ -536,8 +641,8 @@ if __name__ == "__main__":
     # Feature importance
     try:
         importance_df = pd.DataFrame({
-            'feature': final_model.feature_name_,
-            'importance_gain': final_model.feature_importances_,
+            'feature': booster.feature_name(),
+            'importance_gain': booster.feature_importance(importance_type='gain'),
         }).sort_values('importance_gain', ascending=False)
         os.makedirs('output', exist_ok=True)
         importance_path = os.path.join('output', 'feature_importance_report_model_a.xlsx')
@@ -551,15 +656,13 @@ if __name__ == "__main__":
     # Save model
     try:
         os.makedirs('output', exist_ok=True)
-        # Always save sklearn wrapper for robust inference
+        # Save raw booster in text and binary formats; also a pickle for convenience
+        booster_txt = os.path.join('output', 'lgbm_model_a.txt')
+        booster.save_model(booster_txt)
+        print(f"   -> Saved booster to {booster_txt}")
         model_pkl = os.path.join('output', 'lgbm_model_a.pkl')
-        joblib.dump(final_model, model_pkl)
-        print(f"   -> Saved model wrapper to {model_pkl}")
-        # Additionally, export raw booster (optional)
-        if hasattr(final_model, 'booster_') and final_model.booster_ is not None:
-            booster_txt = os.path.join('output', 'lgbm_model_a.txt')
-            final_model.booster_.save_model(booster_txt)
-            print(f"   -> Saved booster to {booster_txt}")
+        joblib.dump(booster, model_pkl)
+        print(f"   -> Saved booster pickle to {model_pkl}")
     except Exception as e:
         print(f"   -> Skipped model save: {e}")
 

@@ -4,6 +4,7 @@ import gc
 import numpy as np
 import pandas as pd
 import joblib
+import lightgbm as lgb
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -86,22 +87,30 @@ def prepare_inference_data(df: pd.DataFrame, feature_cols, categories_map) -> pd
 
 
 if __name__ == "__main__":
-    print("=== Model A Inference (LightGBM on Engineered Features) ===")
+    print("=== Model A Inference (LightGBM, Pseudo-Huber, price space) ===")
 
     # Load metadata and model
     meta_path = os.path.join('output', 'model_a_metadata.json')
     model_path = os.path.join('output', 'lgbm_model_a.pkl')
+    model_txt_path = os.path.join('output', 'lgbm_model_a.txt')
     if not os.path.exists(meta_path):
         raise FileNotFoundError(f"Metadata not found: {meta_path}")
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model not found: {model_path}")
+    if not (os.path.exists(model_path) or os.path.exists(model_txt_path)):
+        raise FileNotFoundError(f"Model not found: {model_path} or {model_txt_path}")
 
     with open(meta_path, 'r', encoding='utf-8') as f:
         metadata = json.load(f)
     feature_cols = metadata['feature_cols']
     categories_map = metadata.get('categories_map', {})
 
-    model = joblib.load(model_path)
+    model = None
+    if os.path.exists(model_path):
+        try:
+            model = joblib.load(model_path)
+        except Exception:
+            model = None
+    if model is None and os.path.exists(model_txt_path):
+        model = lgb.Booster(model_file=model_txt_path)
     print("--- Loaded model and metadata ---")
 
     # Load test data
@@ -114,9 +123,8 @@ if __name__ == "__main__":
     # Prepare features to align with training
     X_test = prepare_inference_data(df_test, feature_cols, categories_map)
 
-    # Predict in log-space and convert back to price
-    preds_log = model.predict(X_test)
-    preds_price = np.expm1(preds_log)
+    # Predict directly in price space
+    preds_price = model.predict(X_test)
     preds_price = np.clip(preds_price, 0.0, None)
 
     # Save

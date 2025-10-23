@@ -5,9 +5,11 @@ Combines Model A (LightGBM) and Model B (Qwen2-VL) predictions
 IMPORTANT: Price Scale Handling
 ===============================
 Model A (LightGBM):
-- Training: Uses log(price+1) as target internally
-- OOF Output: Saves BOTH 'oof_price' (normal scale) AND 'oof_log_price' (log scale)
-- Test Output: Saves 'price' column in NORMAL PRICE SCALE (already converted via np.expm1)
+- Training: Pseudo-Huber objective in ORIGINAL PRICE SPACE (delta from IQR)
+- OOF Output: Saves 'oof_price' in NORMAL PRICE SCALE →
+  "Approach LGBM(with Feat Engg)/output/oof_predictions.csv"
+- Test Output: Saves 'price' in NORMAL PRICE SCALE →
+  "Approach LGBM(with Feat Engg)/dataset/sample_test_out.csv"
   
 Model B (VLM):
 - Training: Directly predicts price (no log transformation)
@@ -33,11 +35,11 @@ from pathlib import Path
 # ============================================================================
 
 # Paths to OOF predictions (Out-Of-Fold predictions from Model A & B)
-MODEL_A_OOF_PATH = "Approach LGBM(with Feat Engg)/output/oof_predictions_train.csv"  # sample_id, fold, oof_pred_log, actual_price
+MODEL_A_OOF_PATH = "Approach LGBM(with Feat Engg)/output/oof_predictions.csv"  # Model A: sample_id, oof_price (price scale)
 MODEL_B_OOF_PATH = "Approach VLM(with SFT)/DDP Approach/oof_predictions_train.csv"   # sample_id, fold, oof_pred, actual_price
 
 # Paths to test predictions from both models
-MODEL_A_TEST_PATH = "Approach LGBM(with Feat Engg)/dataset/sample_test_out.csv"  # sample_id, price (log-transformed)
+MODEL_A_TEST_PATH = "Approach LGBM(with Feat Engg)/dataset/sample_test_out.csv"  # sample_id, price (price scale)
 MODEL_B_TEST_PATH = "Approach VLM(with SFT)/DDP Approach/test_out.csv"            # sample_id, price
 
 # Path to master data for global features
@@ -74,18 +76,18 @@ def load_oof_predictions():
     print("Loading OOF predictions...")
     
     # Load Model A OOF (LightGBM)
-    # Expected columns from train_model_a.py: sample_id, oof_price, oof_log_price
+    # Expected columns from train_model_a.py: sample_id, oof_price (price scale)
     if os.path.exists(MODEL_A_OOF_PATH):
         oof_a = pd.read_csv(MODEL_A_OOF_PATH)
         
-        # Model A saves both oof_price (normal scale) and oof_log_price (log scale)
-        # We use oof_price which is already in normal price scale
+        # Prefer 'oof_price' which is in normal price scale; support backward compatibility
         if 'oof_price' in oof_a.columns:
             oof_a['pred_a'] = oof_a['oof_price']  # Already in price scale
             print("   ✓ Model A: Using 'oof_price' column (normal price scale)")
         elif 'oof_log_price' in oof_a.columns:
-            oof_a['pred_a'] = np.expm1(oof_a['oof_log_price'])  # Convert from log to price
-            print("   ✓ Model A: Using 'oof_log_price' column (converted to price scale)")
+            # Backward-compatibility: older exports might contain log-scale
+            oof_a['pred_a'] = np.expm1(oof_a['oof_log_price'])
+            print("   ✓ Model A: Using 'oof_log_price' column (converted from log to price scale)")
         elif 'oof_pred' in oof_a.columns:
             # Fallback: check if it's in log scale by looking at value ranges
             sample_val = oof_a['oof_pred'].iloc[0]
@@ -130,8 +132,8 @@ def load_oof_predictions():
     else:
         raise FileNotFoundError(f"Model B OOF not found: {MODEL_B_OOF_PATH}")
     
-    # Merge both OOF predictions
-    oof_merged = pd.merge(oof_a, oof_b, on=['sample_id', 'fold'], how='inner')
+    # Merge both OOF predictions on sample_id only (fold assignments may differ across models)
+    oof_merged = pd.merge(oof_a[['sample_id', 'pred_a']], oof_b[['sample_id', 'pred_b']], on='sample_id', how='inner')
     
     print(f"\n✓ Loaded {len(oof_merged)} OOF predictions from both models")
     print(f"  Model A pred range: [{oof_merged['pred_a'].min():.2f}, {oof_merged['pred_a'].max():.2f}]")
@@ -148,16 +150,14 @@ def load_test_predictions():
     print("Loading test predictions...")
     
     # Load Model A test predictions (LightGBM)
-    # predict_model_a.py line 119: preds_price = np.expm1(preds_log)
-    # So the saved 'price' column is ALREADY in normal price scale, NOT log scale
+    # Model A predict script saves 'price' directly in normal price scale (no log transforms)
     if os.path.exists(MODEL_A_TEST_PATH):
         test_a = pd.read_csv(MODEL_A_TEST_PATH)
         
         if 'price' not in test_a.columns:
             raise ValueError(f"Model A test: 'price' column not found. Available: {test_a.columns.tolist()}")
         
-        # Model A's predict_model_a.py already converts log→price via np.expm1
-        # So we use it directly WITHOUT another transformation
+        # Use directly in price scale
         test_a['pred_a'] = test_a['price']  # Already in normal price scale
         print("   ✓ Model A: Loaded test predictions (already in normal price scale)")
     else:
@@ -469,8 +469,8 @@ def main():
     """Main ensemble pipeline"""
     print("\n" + "="*80)
     print("STACKING META-LEARNER ENSEMBLE")
-    print("Model A: LightGBM (log-price)")
-    print("Model B: Qwen2-VL-7B (QLoRA)")
+    print("Model A: LightGBM (Pseudo-Huber, price-space)")
+    print("Model B: Qwen2-VL (fine-tuned)")
     print("="*80)
     
     # Train stacking ensemble
